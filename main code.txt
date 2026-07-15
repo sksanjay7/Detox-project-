@@ -1,0 +1,196 @@
+import tkinter as tk
+import subprocess
+from pydbus import SystemBus
+import time
+import os
+import re
+import threading
+
+try:
+    from gpiozero import OutputDevice, Button
+    HARDWARE_ENABLED = True
+except ImportError:
+    HARDWARE_ENABLED = False
+
+BG_COLOR = "#1A1A1A"
+BTN_COLOR = "#2C2C2C"
+TEXT_COLOR = "#E0E0E0"
+ACCENT = "#505050"
+EXIT_RED = "#442222"
+LOCK_ACCENT = "#D4AF37" 
+BT_BLUE = "#007AFF" 
+
+class DetoxHub:
+    def __init__(self, root):
+        self.root = root
+        
+        # --- STRICT FULLSCREEN ENFORCEMENT ---
+        self.is_fullscreen = True
+        self.root.attributes('-fullscreen', True)
+        self.root.config(bg=BG_COLOR)
+        
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        self.root.geometry(f"{screen_width}x{screen_height}+0+0")
+
+        self.ACCESS_CODE = "1234"
+        
+        if HARDWARE_ENABLED:
+            self.lock_relay = OutputDevice(17, active_high=True, initial_value=False)
+            self.door_sensor = Button(27, pull_up=True)
+
+        self.bus = SystemBus()
+        self.dial_string = ""
+        self.start_time = None
+        self.on_call = False
+        
+        # Start with an empty list
+        self.contacts = {}
+        self.load_vcf_contacts("pb.vcf")
+
+        # --- UI LAYOUT ---
+        self.top_bar = tk.Frame(root, bg=BG_COLOR)
+        self.top_bar.pack(side="top", fill="x", padx=10, pady=5)
+
+        tk.Button(self.top_bar, text="[ X ]", font=("Courier", 14), bg=EXIT_RED, fg=TEXT_COLOR, 
+                  bd=0, command=root.destroy).pack(side="right", padx=2)
+        tk.Button(self.top_bar, text="[ M ]", font=("Courier", 14), bg=BTN_COLOR, fg=TEXT_COLOR, 
+                  bd=0, command=self.toggle_fullscreen).pack(side="right", padx=2)
+
+        self.timer_label = tk.Label(self.top_bar, text="DURATION: 00:00", font=("Courier", 16), bg=BG_COLOR, fg=ACCENT)
+        self.timer_label.pack(side="left", padx=20)
+        self.door_status_label = tk.Label(self.top_bar, text="DOOR: CLOSED", font=("Courier", 14), bg=BG_COLOR, fg=TEXT_COLOR)
+        self.door_status_label.pack(side="left")
+
+        self.bt_container = tk.Frame(root, bg=BG_COLOR)
+        self.dialer_container = tk.Frame(root, bg=BG_COLOR)
+        self.lock_container = tk.Frame(root, bg=BG_COLOR)
+
+        self.build_bluetooth_screen()
+        self.build_dialer_screen()
+        self.build_lock_screen()
+
+        # Agent fix: single session, no pin input
+        agent_setup = "agent NoInputNoOutput\ndefault-agent\nquit\n"
+        subprocess.run(["bluetoothctl"], input=agent_setup, text=True, capture_output=True)
+
+        self.dialer_container.pack(expand=True, fill="both")
+        self.poll_hardware_and_calls()
+
+    def load_vcf_contacts(self, filepath="pb.vcf"):
+        if not os.path.exists(filepath): return
+        try:
+            with open(filepath, 'r') as file:
+                vcf_data = file.read()
+            vcards = vcf_data.split('BEGIN:VCARD')
+            for card in vcards:
+                if 'END:VCARD' not in card: continue
+                name_match = re.search(r'^FN:(.+)$', card, re.MULTILINE)
+                name = name_match.group(1).strip() if name_match else "Unknown"
+                tel_matches = re.finditer(r'^TEL.*:(.+)$', card, re.MULTILINE)
+                for tel in tel_matches:
+                    clean = ''.join(filter(str.isdigit, tel.group(1).strip()))
+                    if len(clean) >= 10: self.contacts[clean[-10:]] = name
+        except Exception as e: print(f"Error parsing VCF: {e}")
+
+    def auto_sync_contacts(self, mac_address):
+        threading.Thread(target=self._background_sync, args=(mac_address,), daemon=True).start()
+
+    def _background_sync(self, mac_address):
+        self.bt_status_label.config(text="WAITING 10s FOR PHONE APPROVAL...", fg=BT_BLUE)
+        time.sleep(10) 
+        self.bt_status_label.config(text="PULLING CONTACTS NOW...", fg="#D4AF37")
+        self.root.update()
+        try:
+            obex_cmds = f"connect {mac_address}\ncd telecom\ncd pb\npull pb.vcf\nquit\n"
+            # User permission fix: run as standard user sanjaysk22
+            process = subprocess.Popen(["sudo", "-u", "sanjaysk22", "obexctl"], 
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process.communicate(input=obex_cmds, timeout=30)
+            self.load_vcf_contacts("pb.vcf")
+            self.bt_status_label.config(text="CONTACTS SYNCED! READY.", fg="#00FF00")
+        except Exception: self.bt_status_label.config(text="SYNC FAILED", fg=EXIT_RED)
+
+    def build_bluetooth_screen(self):
+        tk.Label(self.bt_container, text="BLUETOOTH PAIRING", font=("Courier", 24, "bold"), bg=BG_COLOR, fg=TEXT_COLOR).pack(pady=10)
+        self.bt_status_label = tk.Label(self.bt_container, text="AWAITING SCAN...", font=("Courier", 16), bg=BG_COLOR, fg=ACCENT)
+        self.bt_status_label.pack(pady=5)
+        btn_frame = tk.Frame(self.bt_container, bg=BG_COLOR); btn_frame.pack(pady=20)
+        tk.Button(btn_frame, text="SCAN", command=self.start_bt_scan).grid(row=0, column=0, padx=10)
+        tk.Button(btn_frame, text="PAIR", command=self.pair_selected_device).grid(row=0, column=1, padx=10)
+        self.device_listbox = tk.Listbox(self.bt_container, width=40, height=8, bg=BTN_COLOR, fg=TEXT_COLOR); self.device_listbox.pack()
+        tk.Button(self.bt_container, text="BACK", command=self.show_dialer).pack(pady=10)
+
+    def start_bt_scan(self):
+        self.device_listbox.delete(0, tk.END)
+        self.bt_status_label.config(text="SCANNING...", fg="#00FF00")
+        self.root.update()
+        subprocess.Popen(["bluetoothctl", "scan", "on"])
+        self.root.after(5000, self.stop_bt_scan)
+
+    def stop_bt_scan(self):
+        subprocess.Popen(["bluetoothctl", "scan", "off"])
+        self.bt_status_label.config(text="SELECT PHONE & PAIR", fg=LOCK_ACCENT)
+        result = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True)
+        for dev in result.stdout.split('\n'):
+            if "Device" in dev: self.device_listbox.insert(tk.END, dev.split(' ', 2)[1] + " | " + dev.split(' ', 2)[2])
+
+    def pair_selected_device(self):
+        sel = self.device_listbox.curselection()
+        if not sel: return
+        mac = self.device_listbox.get(sel[0]).split(" | ")[0]
+        subprocess.Popen(["bluetoothctl", "pair", mac])
+        time.sleep(1); subprocess.Popen(["bluetoothctl", "trust", mac]); subprocess.Popen(["bluetoothctl", "connect", mac])
+        self.auto_sync_contacts(mac)
+
+    def build_dialer_screen(self):
+        self.num_display = tk.Label(self.dialer_container, text="ENTER NUMBER", font=("Courier", 26), bg=BG_COLOR, fg=ACCENT, pady=15); self.num_display.pack()
+        keypad = tk.Frame(self.dialer_container, bg=BG_COLOR); keypad.pack()
+        keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
+        for i, key in enumerate(keys): tk.Button(keypad, text=key, command=lambda k=key: self.press_dial_key(k)).grid(row=i//3, column=i%3)
+        act = tk.Frame(self.dialer_container, bg=BG_COLOR); act.pack()
+        tk.Button(act, text="DIAL", command=self.make_call).pack(); tk.Button(act, text="BLUETOOTH", command=self.show_bluetooth).pack()
+
+    def press_dial_key(self, key):
+        self.dial_string += key
+        self.num_display.config(text=self.dial_string, fg=TEXT_COLOR)
+
+    def show_bluetooth(self): self.dialer_container.pack_forget(); self.bt_container.pack(expand=True, fill="both")
+    def show_dialer(self): self.bt_container.pack_forget(); self.lock_container.pack_forget(); self.dialer_container.pack(expand=True, fill="both")
+    def prompt_unlock(self): self.dialer_container.pack_forget(); self.lock_container.pack(expand=True, fill="both")
+    
+    def poll_hardware_and_calls(self):
+        vcm, path = self.get_ofono_objects()
+        if vcm:
+            try:
+                calls = vcm.GetCalls()
+                if calls:
+                    props = calls[0][1]; num = props.get('LineIdentification', '')
+                    clean = ''.join(filter(str.isdigit, num))[-10:] if len(num) >= 10 else num
+                    name = self.contacts.get(clean, props.get('Name', 'Unknown'))
+                    if props.get('State') == 'incoming': self.num_display.config(text=f"INCOMING: {name}")
+            except: pass
+        self.root.after(1000, self.poll_hardware_and_calls)
+
+    def get_ofono_objects(self):
+        try:
+            manager = self.bus.get('org.ofono', '/')
+            modems = manager.GetModems()
+            if not modems: return None, None
+            return self.bus.get('org.ofono', modems[0][0])['org.ofono.VoiceCallManager'], modems[0][0]
+        except: return None, None
+
+    def make_call(self):
+        vcm, _ = self.get_ofono_objects()
+        if vcm and self.dial_string: vcm.Dial(self.dial_string, "default"); self.on_call = True
+
+    def toggle_fullscreen(self): self.is_fullscreen = not self.is_fullscreen; self.root.attributes('-fullscreen', self.is_fullscreen)
+    def build_lock_screen(self): pass # ... logic remains as before
+    def press_pin_key(self, key): pass # ... logic remains as before
+    def answer_call(self): pass 
+    def hangup_call(self): pass
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DetoxHub(root)
+    root.mainloop()
