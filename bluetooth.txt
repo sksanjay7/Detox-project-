@@ -1,0 +1,41 @@
+1. Bluetooth Agent Initialization
+This block runs at startup inside the __init__ method. It registers the system as a "NoInputNoOutput" device to ensure silent, automatic pairing without needing a screen or keyboard for PIN entry.
+
+Python
+        # Agent fix: single session, no pin input
+        agent_setup = "agent NoInputNoOutput\ndefault-agent\nquit\n"
+        subprocess.run(["bluetoothctl"], input=agent_setup, text=True, capture_output=True)
+2. Device Scanning
+The start_bt_scan method triggers the Raspberry Pi's Bluetooth radio to search for nearby devices.
+
+Python
+    def start_bt_scan(self):
+        self.device_listbox.delete(0, tk.END)
+        self.bt_status_label.config(text="SCANNING...", fg="#00FF00")
+        self.root.update()
+        subprocess.Popen(["bluetoothctl", "scan", "on"])
+        self.root.after(5000, self.stop_bt_scan)
+3. Pairing and Trusting
+The pair_selected_device method performs the three essential Bluetooth actions: it pairs with the device, trusts the device so it can reconnect automatically, and initiates the connection.
+
+Python
+    def pair_selected_device(self):
+        sel = self.device_listbox.curselection()
+        if not sel: return
+        mac = self.device_listbox.get(sel[0]).split(" | ")[0]
+        subprocess.Popen(["bluetoothctl", "pair", mac])
+        time.sleep(1); subprocess.Popen(["bluetoothctl", "trust", mac]); subprocess.Popen(["bluetoothctl", "connect", mac])
+        self.auto_sync_contacts(mac)
+4. Background OBEX Syncing
+This method runs in a separate thread to handle the contact syncing without freezing your UI. It explicitly uses sudo -u sanjaysk22 to ensure the OBEX process runs with the correct user permissions.
+
+Python
+    def _background_sync(self, mac_address):
+        # ... (timer logic)
+        try:
+            obex_cmds = f"connect {mac_address}\ncd telecom\ncd pb\npull pb.vcf\nquit\n"
+            # User permission fix: run as standard user sanjaysk22
+            process = subprocess.Popen(["sudo", "-u", "sanjaysk22", "obexctl"], 
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process.communicate(input=obex_cmds, timeout=30)
+            # ... (loading logic)
